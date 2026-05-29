@@ -27,6 +27,23 @@ USER_AGENT = "SGI-GeoServer/1.2 (sgi.dministrativo@gmail.com)"
 
 # MAGNA-SIRGAS Origen Nacional (CTM12) = EPSG:9377 (metros Este/Norte)
 EPSG_MAGNA = "EPSG:9377"
+# Mismos parámetros, explícitos (por si el servidor no trae el código EPSG en su base PROJ)
+PROJ_MAGNA = ("+proj=tmerc +lat_0=4 +lon_0=-73 +k=0.9992 +x_0=5000000 "
+              "+y_0=2000000 +ellps=GRS80 +towgs84=0,0,0 +units=m +no_defs +type=crs")
+
+
+def _transformers_magna():
+    """Devuelve (a_magna, a_wgs). Usa EPSG:9377 si está disponible; si no, los parámetros explícitos."""
+    try:
+        a = Transformer.from_crs("EPSG:4326", EPSG_MAGNA, always_xy=True)
+        b = Transformer.from_crs(EPSG_MAGNA, "EPSG:4326", always_xy=True)
+        a.transform(-73.0, 4.0)
+        b.transform(5000000.0, 2000000.0)
+        return a, b
+    except Exception:
+        a = Transformer.from_crs("EPSG:4326", PROJ_MAGNA, always_xy=True)
+        b = Transformer.from_crs(PROJ_MAGNA, "EPSG:4326", always_xy=True)
+        return a, b
 
 
 @app.get("/")
@@ -41,6 +58,29 @@ def home():
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/diagnostico")
+def diagnostico():
+    """Verifica que el servidor pueda proyectar a MAGNA-SIRGAS (para depurar la grilla)."""
+    info = {}
+    try:
+        import pyproj
+        info["pyproj"] = pyproj.__version__
+        info["proj"] = pyproj.proj_version_str
+    except Exception as e:
+        info["pyproj_error"] = str(e)
+    try:
+        Transformer.from_crs("EPSG:4326", EPSG_MAGNA, always_xy=True).transform(-73.0, 4.0)
+        info["epsg_9377"] = "ok"
+    except Exception as e:
+        info["epsg_9377"] = f"error: {e}"
+    try:
+        Transformer.from_crs("EPSG:4326", PROJ_MAGNA, always_xy=True).transform(-73.0, 4.0)
+        info["proj_string"] = "ok"
+    except Exception as e:
+        info["proj_string"] = f"error: {e}"
+    return info
 
 
 # ------------------------------------------------------------
@@ -282,8 +322,7 @@ def _dibujar_grilla_escala(imagen, lonlat_to_pixel, bounds):
     W, H = imagen.size
     lon_min, lat_min, lon_max, lat_max = bounds
 
-    to_magna = Transformer.from_crs("EPSG:4326", EPSG_MAGNA, always_xy=True)
-    to_wgs = Transformer.from_crs(EPSG_MAGNA, "EPSG:4326", always_xy=True)
+    to_magna, to_wgs = _transformers_magna()
 
     esquinas = [(lon_min, lat_min), (lon_max, lat_min), (lon_min, lat_max), (lon_max, lat_max)]
     EN = [to_magna.transform(lo, la) for lo, la in esquinas]
