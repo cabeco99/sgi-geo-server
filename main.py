@@ -333,7 +333,8 @@ def _dibujar_grilla_escala(imagen, lonlat_to_pixel, bounds):
 
     paso = _paso_bonito(max(Emax - Emin, Nmax - Nmin), 5)
     fuente = _cargar_fuente(12)
-    color_linea = (110, 110, 110)
+    color_linea = (70, 70, 70)
+    grosor = 2
 
     # Líneas de Este (verticales)
     e = math.ceil(Emin / paso) * paso
@@ -343,7 +344,7 @@ def _dibujar_grilla_escala(imagen, lonlat_to_pixel, bounds):
             n = Nmin + (Nmax - Nmin) * k / 20.0
             lon, lat = to_wgs.transform(e, n)
             pts.append(lonlat_to_pixel(lon, lat))
-        draw.line(pts, fill=color_linea, width=1)
+        draw.line(pts, fill=color_linea, width=grosor)
         lon, lat = to_wgs.transform(e, Nmin)
         px, _ = lonlat_to_pixel(lon, lat)
         _texto_con_fondo(draw, (min(max(px + 2, 2), W - 70), H - 16),
@@ -358,7 +359,7 @@ def _dibujar_grilla_escala(imagen, lonlat_to_pixel, bounds):
             ee = Emin + (Emax - Emin) * k / 20.0
             lon, lat = to_wgs.transform(ee, n)
             pts.append(lonlat_to_pixel(lon, lat))
-        draw.line(pts, fill=color_linea, width=1)
+        draw.line(pts, fill=color_linea, width=grosor)
         lon, lat = to_wgs.transform(Emin, n)
         _, py = lonlat_to_pixel(lon, lat)
         _texto_con_fondo(draw, (2, min(max(py - 6, 2), H - 16)),
@@ -431,11 +432,13 @@ async def plano_kmz(archivo: UploadFile = File(...)):
             lon, lat = coords[0]
             mapa.add_marker(CircleMarker((lon, lat), "#8E1B1B", 16))
             mapa.add_marker(CircleMarker((lon, lat), "#E74C3C", 10))
-        else:
+        elif g["tipo"] == "Polygon":
             anillo = list(coords)
             if anillo[0] != anillo[-1]:
-                anillo.append(anillo[0])
+                anillo.append(anillo[0])  # cerrar SOLO los polígonos
             mapa.add_line(Line(anillo, "#C0392B", 4))
+        else:  # LineString u otros: dibujar tal cual, sin cerrar
+            mapa.add_line(Line(list(coords), "#C0392B", 4))
 
     lons = [c[0] for c in todas]
     lats = [c[1] for c in todas]
