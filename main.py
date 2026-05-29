@@ -1,12 +1,14 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 import zipfile
 import io
 import time
 import xml.etree.ElementTree as ET
 import requests
+from staticmap import StaticMap, CircleMarker, Line
 
-app = FastAPI(title="SGI Geo Server", version="1.0")
+app = FastAPI(title="SGI Geo Server", version="1.1")
 
 # Permite que el formulario / Apps Script consuman este API
 app.add_middleware(
@@ -17,7 +19,8 @@ app.add_middleware(
 )
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/reverse"
-USER_AGENT = "SGI-GeoServer/1.0 (sgi.dministrativo@gmail.com)"
+TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+USER_AGENT = "SGI-GeoServer/1.1 (sgi.dministrativo@gmail.com)"
 
 
 @app.get("/")
@@ -59,7 +62,7 @@ def _centroide(puntos):
 
 
 def _extraer_placemarks(kml_text: str):
-    """Devuelve lista de sitios: {nombre, tipo, lon, lat, vertices}."""
+    """Devuelve lista de sitios para geocodificar: {nombre, tipo, lon, lat, vertices}."""
     try:
         root = ET.fromstring(kml_text)
     except ET.ParseError as e:
@@ -103,6 +106,41 @@ def _extraer_placemarks(kml_text: str):
             "vertices": len(pares),
         })
     return resultados
+
+
+def _extraer_geometrias(kml_text: str):
+    """Devuelve geometrías completas para dibujar: [{tipo, coords:[(lon,lat),...]}]."""
+    try:
+        root = ET.fromstring(kml_text)
+    except ET.ParseError as e:
+        raise ValueError(f"No se pudo leer el KML: {e}")
+
+    geoms = []
+    for elem in root.iter():
+        if _sin_namespace(elem.tag) != "Placemark":
+            continue
+        for hijo in elem.iter():
+            etiqueta = _sin_namespace(hijo.tag)
+            if etiqueta not in ("Point", "Polygon", "LineString"):
+                continue
+            coords_texto = None
+            for sub in hijo.iter():
+                if _sin_namespace(sub.tag) == "coordinates":
+                    coords_texto = sub.text or ""
+                    break
+            if not coords_texto:
+                continue
+            pares = []
+            for c in coords_texto.split():
+                partes = c.strip().split(",")
+                if len(partes) >= 2:
+                    try:
+                        pares.append((float(partes[0]), float(partes[1])))
+                    except ValueError:
+                        continue
+            if pares:
+                geoms.append({"tipo": etiqueta, "coords": pares})
+    return geoms
 
 
 def _geocodificar_inverso(lat: float, lon: float) -> dict:
@@ -176,3 +214,59 @@ async def procesar_kmz(archivo: UploadFile = File(...)):
         },
         "sitios": resultados,
     }
+
+
+@app.post("/plano-kmz")
+async def plano_kmz(archivo: UploadFile = File(...)):
+    """Genera un PNG con el mapa de localización (puntos/polígonos del KMZ sobre OSM)."""
+    contenido = await archivo.read()
+    if not contenido:
+        raise HTTPException(status_code=400, detail="El archivo está vacío.")
+    try:
+        kml_text = _leer_kml(contenido, archivo.filename)
+        geoms = _extraer_geometrias(kml_text)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if not geoms:
+        raise HTTPException(status_code=422, detail="No se encontraron geometrías en el archivo.")
+
+    # 600x400 = relación 3:2 (igual que los 450x300 que usa la oferta, sin distorsión)
+    mapa = StaticMap(
+        600, 400,
+        url_template=TILE_URL,
+        headers={"User-Agent": USER_AGENT},
+        tile_request_timeout=15,
+    )
+
+    todas = []
+    for g in geoms:
+        coords = g["coords"]
+        todas.extend(coords)
+        if g["tipo"] == "Point":
+            lon, lat = coords[0]
+            mapa.add_marker(CircleMarker((lon, lat), "#8E1B1B", 16))
+            mapa.add_marker(CircleMarker((lon, lat), "#E74C3C", 10))
+        else:
+            anillo = list(coords)
+            if anillo[0] != anillo[-1]:
+                anillo.append(anillo[0])  # cerrar el polígono
+            mapa.add_line(Line(anillo, "#C0392B", 4))
+
+    lons = [c[0] for c in todas]
+    lats = [c[1] for c in todas]
+    extension = max(max(lons) - min(lons), max(lats) - min(lats))
+
+    try:
+        if extension < 0.002:  # un solo punto o área diminuta: fijar un zoom cómodo
+            centro = (sum(lons) / len(lons), sum(lats) / len(lats))
+            imagen = mapa.render(zoom=15, center=centro)
+        else:
+            imagen = mapa.render()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"No se pudo generar el plano: {e}")
+
+    buf = io.BytesIO()
+    imagen.save(buf, format="PNG")
+    buf.seek(0)
+    return StreamingResponse(buf, media_type="image/png")
