@@ -22,6 +22,7 @@ app.add_middleware(
 )
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/reverse"
+BIGDATA_URL = "https://api.bigdatacloud.net/data/reverse-geocode-client"
 TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
 USER_AGENT = "SGI-GeoServer/1.2 (sgi.dministrativo@gmail.com)"
 
@@ -188,28 +189,76 @@ def _extraer_geometrias(kml_text: str):
     return geoms
 
 
-def _geocodificar_inverso(lat: float, lon: float) -> dict:
-    try:
-        r = requests.get(
-            NOMINATIM_URL,
-            params={"lat": lat, "lon": lon, "format": "json",
-                    "accept-language": "es", "addressdetails": 1, "zoom": 14},
-            headers={"User-Agent": USER_AGENT},
-            timeout=15,
-        )
-        r.raise_for_status()
-        data = r.json()
-    except Exception as e:
-        return {"error": f"No se pudo geocodificar: {e}"}
-
+def _geocodificar_nominatim(lat: float, lon: float) -> dict:
+    r = requests.get(
+        NOMINATIM_URL,
+        params={"lat": lat, "lon": lon, "format": "json",
+                "accept-language": "es", "addressdetails": 1, "zoom": 14},
+        headers={"User-Agent": USER_AGENT},
+        timeout=15,
+    )
+    r.raise_for_status()
+    data = r.json()
     dir_ = data.get("address", {})
     municipio = (dir_.get("city") or dir_.get("town") or dir_.get("village")
-                 or dir_.get("municipality") or dir_.get("county"))
+                 or dir_.get("municipality") or dir_.get("locality")
+                 or dir_.get("hamlet") or dir_.get("county"))
+    departamento = (dir_.get("state") or dir_.get("region")
+                    or dir_.get("state_district") or dir_.get("province"))
     return {
         "municipio": municipio,
-        "departamento": dir_.get("state"),
+        "departamento": departamento,
         "pais": dir_.get("country"),
         "direccion_completa": data.get("display_name"),
+        "fuente": "nominatim",
+    }
+
+
+def _geocodificar_bigdatacloud(lat: float, lon: float) -> dict:
+    r = requests.get(
+        BIGDATA_URL,
+        params={"latitude": lat, "longitude": lon, "localityLanguage": "es"},
+        headers={"User-Agent": USER_AGENT},
+        timeout=15,
+    )
+    r.raise_for_status()
+    data = r.json()
+    municipio = (data.get("city") or data.get("locality") or None)
+    departamento = (data.get("principalSubdivision") or None)
+    partes = [data.get("locality"), data.get("city"),
+              data.get("principalSubdivision"), data.get("countryName")]
+    return {
+        "municipio": municipio,
+        "departamento": departamento,
+        "pais": data.get("countryName"),
+        "direccion_completa": ", ".join([p for p in partes if p]),
+        "fuente": "bigdatacloud",
+    }
+
+
+def _geocodificar_inverso(lat: float, lon: float) -> dict:
+    """Intenta Nominatim (con reintentos) y, si falla, usa BigDataCloud como respaldo."""
+    errores = []
+    for intento in range(2):
+        try:
+            res = _geocodificar_nominatim(lat, lon)
+            if res.get("municipio") or res.get("departamento"):
+                return res
+        except Exception as e:
+            errores.append(f"nominatim: {e}")
+        time.sleep(1)
+    try:
+        res = _geocodificar_bigdatacloud(lat, lon)
+        if res.get("municipio") or res.get("departamento"):
+            return res
+    except Exception as e:
+        errores.append(f"bigdatacloud: {e}")
+    return {
+        "municipio": None,
+        "departamento": None,
+        "pais": None,
+        "direccion_completa": None,
+        "error": " | ".join(errores) if errores else "sin resultado de ninguna fuente",
     }
 
 
