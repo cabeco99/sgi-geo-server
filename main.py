@@ -4,11 +4,14 @@ from fastapi.responses import StreamingResponse
 import zipfile
 import io
 import time
+import math
 import xml.etree.ElementTree as ET
 import requests
 from staticmap import StaticMap, CircleMarker, Line
+from PIL import ImageDraw, ImageFont
+from pyproj import Transformer
 
-app = FastAPI(title="SGI Geo Server", version="1.1")
+app = FastAPI(title="SGI Geo Server", version="1.2")
 
 # Permite que el formulario / Apps Script consuman este API
 app.add_middleware(
@@ -20,7 +23,10 @@ app.add_middleware(
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/reverse"
 TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
-USER_AGENT = "SGI-GeoServer/1.1 (sgi.dministrativo@gmail.com)"
+USER_AGENT = "SGI-GeoServer/1.2 (sgi.dministrativo@gmail.com)"
+
+# MAGNA-SIRGAS Origen Nacional (CTM12) = EPSG:9377 (metros Este/Norte)
+EPSG_MAGNA = "EPSG:9377"
 
 
 @app.get("/")
@@ -37,13 +43,14 @@ def health():
     return {"status": "ok"}
 
 
+# ------------------------------------------------------------
+# LECTURA DE KMZ / KML
+# ------------------------------------------------------------
 def _sin_namespace(tag: str) -> str:
-    """'{http://...}Point' -> 'Point'."""
     return tag.split("}", 1)[-1] if "}" in tag else tag
 
 
 def _leer_kml(contenido: bytes, nombre: str) -> str:
-    """Obtiene el texto KML, venga como .kml o dentro de un .kmz (zip)."""
     nombre = (nombre or "").lower()
     if nombre.endswith(".kmz") or contenido[:2] == b"PK":
         with zipfile.ZipFile(io.BytesIO(contenido)) as z:
@@ -62,7 +69,6 @@ def _centroide(puntos):
 
 
 def _extraer_placemarks(kml_text: str):
-    """Devuelve lista de sitios para geocodificar: {nombre, tipo, lon, lat, vertices}."""
     try:
         root = ET.fromstring(kml_text)
     except ET.ParseError as e:
@@ -109,7 +115,6 @@ def _extraer_placemarks(kml_text: str):
 
 
 def _extraer_geometrias(kml_text: str):
-    """Devuelve geometrías completas para dibujar: [{tipo, coords:[(lon,lat),...]}]."""
     try:
         root = ET.fromstring(kml_text)
     except ET.ParseError as e:
@@ -144,18 +149,11 @@ def _extraer_geometrias(kml_text: str):
 
 
 def _geocodificar_inverso(lat: float, lon: float) -> dict:
-    """Reverse geocoding con Nominatim (OpenStreetMap)."""
     try:
         r = requests.get(
             NOMINATIM_URL,
-            params={
-                "lat": lat,
-                "lon": lon,
-                "format": "json",
-                "accept-language": "es",
-                "addressdetails": 1,
-                "zoom": 14,
-            },
+            params={"lat": lat, "lon": lon, "format": "json",
+                    "accept-language": "es", "addressdetails": 1, "zoom": 14},
             headers={"User-Agent": USER_AGENT},
             timeout=15,
         )
@@ -165,13 +163,8 @@ def _geocodificar_inverso(lat: float, lon: float) -> dict:
         return {"error": f"No se pudo geocodificar: {e}"}
 
     dir_ = data.get("address", {})
-    municipio = (
-        dir_.get("city")
-        or dir_.get("town")
-        or dir_.get("village")
-        or dir_.get("municipality")
-        or dir_.get("county")
-    )
+    municipio = (dir_.get("city") or dir_.get("town") or dir_.get("village")
+                 or dir_.get("municipality") or dir_.get("county"))
     return {
         "municipio": municipio,
         "departamento": dir_.get("state"),
@@ -180,6 +173,166 @@ def _geocodificar_inverso(lat: float, lon: float) -> dict:
     }
 
 
+# ------------------------------------------------------------
+# UTILIDADES DEL PLANO (grilla + escala)
+# ------------------------------------------------------------
+def _tilex_to_lon(x, zoom):
+    return x / pow(2, zoom) * 360.0 - 180.0
+
+
+def _tiley_to_lat(y, zoom):
+    n = math.pi - 2.0 * math.pi * y / pow(2, zoom)
+    return math.degrees(math.atan(math.sinh(n)))
+
+
+def _lon_to_tilex(lon, zoom):
+    return ((lon + 180.0) / 360.0) * pow(2, zoom)
+
+
+def _lat_to_tiley(lat, zoom):
+    lat_r = math.radians(lat)
+    return (1 - math.log(math.tan(lat_r) + 1 / math.cos(lat_r)) / math.pi) / 2 * pow(2, zoom)
+
+
+def _paso_bonito(rango, divisiones=5):
+    """Devuelve un paso 'redondo' (1, 2, 5 x 10^n) cercano a rango/divisiones."""
+    if rango <= 0:
+        return 1
+    bruto = rango / divisiones
+    exp = math.floor(math.log10(bruto)) if bruto > 0 else 0
+    base = bruto / (10 ** exp)
+    if base < 1.5:
+        nice = 1
+    elif base < 3:
+        nice = 2
+    elif base < 7:
+        nice = 5
+    else:
+        nice = 10
+    return nice * (10 ** exp)
+
+
+def _cargar_fuente(size):
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        pass
+    for ruta in ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                 "/usr/share/fonts/dejavu/DejaVuSans.ttf"):
+        try:
+            return ImageFont.truetype(ruta, size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+
+def _miles(valor):
+    """Formatea un entero con separador de miles tipo '4.812.300'."""
+    return f"{int(round(valor)):,}".replace(",", ".")
+
+
+def _texto_con_fondo(draw, xy, texto, fuente, color_txt=(20, 20, 20)):
+    x, y = xy
+    try:
+        bbox = draw.textbbox((x, y), texto, font=fuente)
+    except Exception:
+        w = draw.textlength(texto, font=fuente)
+        bbox = (x, y, x + w, y + 12)
+    draw.rectangle([bbox[0] - 2, bbox[1] - 1, bbox[2] + 2, bbox[3] + 1], fill=(255, 255, 255))
+    draw.text((x, y), texto, font=fuente, fill=color_txt)
+
+
+def _dibujar_escala(draw, size, lonlat_to_pixel, to_magna, to_wgs, bounds, fuente):
+    W, H = size
+    lon_min, lat_min, lon_max, lat_max = bounds
+    lon_c = (lon_min + lon_max) / 2
+    lat_c = (lat_min + lat_max) / 2
+    E_c, N_c = to_magna.transform(lon_c, lat_c)
+    lon2, lat2 = to_wgs.transform(E_c + 1000, N_c)
+    p1 = lonlat_to_pixel(lon_c, lat_c)
+    p2 = lonlat_to_pixel(lon2, lat2)
+    dpx = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+    if dpx <= 0:
+        return
+    m_por_px = 1000.0 / dpx
+    bar_m = _paso_bonito(W * 0.25 * m_por_px, 1)
+    if bar_m <= 0:
+        bar_m = 100
+    bar_px = bar_m / m_por_px
+    bar_px = max(40, min(bar_px, W * 0.45))
+
+    x2 = W - 18
+    x1 = x2 - bar_px
+    y1 = H - 24
+    mid = (x1 + x2) / 2
+
+    draw.rectangle([x1 - 8, y1 - 15, x2 + 8, y1 + 11], fill=(255, 255, 255))
+    draw.rectangle([x1, y1, mid, y1 + 6], fill=(0, 0, 0), outline=(0, 0, 0))
+    draw.rectangle([mid, y1, x2, y1 + 6], fill=(255, 255, 255), outline=(0, 0, 0))
+    draw.rectangle([x1, y1, x2, y1 + 6], outline=(0, 0, 0))
+
+    etiqueta = (f"{bar_m / 1000:g} km" if bar_m >= 1000 else f"{int(bar_m)} m")
+    draw.text((x1 - 3, y1 - 14), "0", font=fuente, fill=(0, 0, 0))
+    draw.text((x2 - 22, y1 - 14), etiqueta, font=fuente, fill=(0, 0, 0))
+
+
+def _dibujar_grilla_escala(imagen, lonlat_to_pixel, bounds):
+    """Dibuja la grilla MAGNA-SIRGAS (E/N) con etiquetas y la barra de escala."""
+    draw = ImageDraw.Draw(imagen)
+    W, H = imagen.size
+    lon_min, lat_min, lon_max, lat_max = bounds
+
+    to_magna = Transformer.from_crs("EPSG:4326", EPSG_MAGNA, always_xy=True)
+    to_wgs = Transformer.from_crs(EPSG_MAGNA, "EPSG:4326", always_xy=True)
+
+    esquinas = [(lon_min, lat_min), (lon_max, lat_min), (lon_min, lat_max), (lon_max, lat_max)]
+    EN = [to_magna.transform(lo, la) for lo, la in esquinas]
+    Es = [e for e, n in EN]
+    Ns = [n for e, n in EN]
+    Emin, Emax = min(Es), max(Es)
+    Nmin, Nmax = min(Ns), max(Ns)
+
+    paso = _paso_bonito(max(Emax - Emin, Nmax - Nmin), 5)
+    fuente = _cargar_fuente(12)
+    color_linea = (110, 110, 110)
+
+    # Líneas de Este (verticales)
+    e = math.ceil(Emin / paso) * paso
+    while e <= Emax:
+        pts = []
+        for k in range(21):
+            n = Nmin + (Nmax - Nmin) * k / 20.0
+            lon, lat = to_wgs.transform(e, n)
+            pts.append(lonlat_to_pixel(lon, lat))
+        draw.line(pts, fill=color_linea, width=1)
+        lon, lat = to_wgs.transform(e, Nmin)
+        px, _ = lonlat_to_pixel(lon, lat)
+        _texto_con_fondo(draw, (min(max(px + 2, 2), W - 70), H - 16),
+                         f"{_miles(e)} E", fuente)
+        e += paso
+
+    # Líneas de Norte (horizontales)
+    n = math.ceil(Nmin / paso) * paso
+    while n <= Nmax:
+        pts = []
+        for k in range(21):
+            ee = Emin + (Emax - Emin) * k / 20.0
+            lon, lat = to_wgs.transform(ee, n)
+            pts.append(lonlat_to_pixel(lon, lat))
+        draw.line(pts, fill=color_linea, width=1)
+        lon, lat = to_wgs.transform(Emin, n)
+        _, py = lonlat_to_pixel(lon, lat)
+        _texto_con_fondo(draw, (2, min(max(py - 6, 2), H - 16)),
+                         f"{_miles(n)} N", fuente)
+        n += paso
+
+    _dibujar_escala(draw, imagen.size, lonlat_to_pixel, to_magna, to_wgs, bounds, fuente)
+    return imagen
+
+
+# ------------------------------------------------------------
+# ENDPOINTS
+# ------------------------------------------------------------
 @app.post("/procesar-kmz")
 async def procesar_kmz(archivo: UploadFile = File(...)):
     contenido = await archivo.read()
@@ -192,17 +345,15 @@ async def procesar_kmz(archivo: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail=str(e))
 
     if not sitios:
-        raise HTTPException(
-            status_code=422,
-            detail="No se encontraron puntos ni polígonos en el archivo.",
-        )
+        raise HTTPException(status_code=422,
+                            detail="No se encontraron puntos ni polígonos en el archivo.")
 
     resultados = []
     for i, p in enumerate(sitios):
         p["ubicacion"] = _geocodificar_inverso(p["lat"], p["lon"])
         resultados.append(p)
         if i < len(sitios) - 1:
-            time.sleep(1)  # Nominatim exige máx. 1 petición por segundo
+            time.sleep(1)
 
     principal = resultados[0]["ubicacion"]
     return {
@@ -218,7 +369,6 @@ async def procesar_kmz(archivo: UploadFile = File(...)):
 
 @app.post("/plano-kmz")
 async def plano_kmz(archivo: UploadFile = File(...)):
-    """Genera un PNG con el mapa de localización (puntos/polígonos del KMZ sobre OSM)."""
     contenido = await archivo.read()
     if not contenido:
         raise HTTPException(status_code=400, detail="El archivo está vacío.")
@@ -231,13 +381,8 @@ async def plano_kmz(archivo: UploadFile = File(...)):
     if not geoms:
         raise HTTPException(status_code=422, detail="No se encontraron geometrías en el archivo.")
 
-    # 600x400 = relación 3:2 (igual que los 450x300 que usa la oferta, sin distorsión)
-    mapa = StaticMap(
-        600, 400,
-        url_template=TILE_URL,
-        headers={"User-Agent": USER_AGENT},
-        tile_request_timeout=15,
-    )
+    mapa = StaticMap(700, 470, url_template=TILE_URL,
+                     headers={"User-Agent": USER_AGENT}, tile_request_timeout=20)
 
     todas = []
     for g in geoms:
@@ -250,7 +395,7 @@ async def plano_kmz(archivo: UploadFile = File(...)):
         else:
             anillo = list(coords)
             if anillo[0] != anillo[-1]:
-                anillo.append(anillo[0])  # cerrar el polígono
+                anillo.append(anillo[0])
             mapa.add_line(Line(anillo, "#C0392B", 4))
 
     lons = [c[0] for c in todas]
@@ -258,13 +403,36 @@ async def plano_kmz(archivo: UploadFile = File(...)):
     extension = max(max(lons) - min(lons), max(lats) - min(lats))
 
     try:
-        if extension < 0.002:  # un solo punto o área diminuta: fijar un zoom cómodo
+        if extension < 0.002:
             centro = (sum(lons) / len(lons), sum(lats) / len(lats))
             imagen = mapa.render(zoom=15, center=centro)
         else:
             imagen = mapa.render()
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"No se pudo generar el plano: {e}")
+        raise HTTPException(status_code=502, detail=f"No se pudo generar el mapa base: {e}")
+
+    # Overlay de grilla MAGNA-SIRGAS + barra de escala (si algo falla, devuelve el mapa base)
+    try:
+        imagen = imagen.convert("RGB")
+
+        def lonlat_to_pixel(lon, lat):
+            x = _lon_to_tilex(lon, mapa.zoom)
+            y = _lat_to_tiley(lat, mapa.zoom)
+            px = (x - mapa.x_center) * mapa.tile_size + mapa.width / 2
+            py = (y - mapa.y_center) * mapa.tile_size + mapa.height / 2
+            return (px, py)
+
+        left = mapa.x_center - (mapa.width / 2) / mapa.tile_size
+        right = mapa.x_center + (mapa.width / 2) / mapa.tile_size
+        top = mapa.y_center - (mapa.height / 2) / mapa.tile_size
+        bottom = mapa.y_center + (mapa.height / 2) / mapa.tile_size
+        bounds = (
+            _tilex_to_lon(left, mapa.zoom), _tiley_to_lat(bottom, mapa.zoom),
+            _tilex_to_lon(right, mapa.zoom), _tiley_to_lat(top, mapa.zoom),
+        )
+        _dibujar_grilla_escala(imagen, lonlat_to_pixel, bounds)
+    except Exception:
+        pass  # devolver al menos el mapa base si la grilla falla
 
     buf = io.BytesIO()
     imagen.save(buf, format="PNG")
